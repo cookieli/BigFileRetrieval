@@ -1,62 +1,84 @@
 package lzx.retrieval.storage;
 
-import java.io.File;
+
 import java.io.IOException;
-import java.io.RandomAccessFile;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 
 import lzx.retrieval.BufferedReader;
+import lzx.retrieval.ByteUtils;
 import lzx.retrieval.KVPair;
+import lzx.retrieval.storage.BTreeLeafNode.NodeKeyPos;
 
 public class BTreeInternalNode extends BTreeNode{
 	
-	public ArrayList<Long> keys;
 	
 	public ArrayList<Integer> children;
 	
 	public int rightSiblingNode = -1;
 	
-	public BTreeInternalNode(Long key, int ch1, int ch2) {
-		keys = new ArrayList<>();
+	public BTreeInternalNode(String dictionary) {
+		this.dictionary = dictionary;
+		isInternal = false;
+		isLeaf = true;
+	}
+	
+	public BTreeInternalNode(byte[] bytes, long originFilePos, int ch1, int ch2, String dict) {
+		positions = new ArrayList<>();
+		data = new ArrayList<>();
 		children = new ArrayList<>();
 		isInternal = true;
 		isLeaf = false;
-		keys.add(key);
+		positions.add(new NodeKeyPos(0, bytes.length, originFilePos));
+		this.nodeFile = "tmp.nd";
+		setDictionary(dict);
+		this.addKey(bytes);
+		curNodeSize = bytes.length;
 		children.add(ch1);
 		children.add(ch2);
+		
 	}
 	
-	public BTreeInternalNode(ArrayList<Long> keys, ArrayList<Integer> children) {
-		this.keys = keys;
-		this.children = children;
+	public BTreeInternalNode(ArrayList<NodeKeyPos> keys, ArrayList<Integer> children, BTreeInternalNode n, String dict) {
+		super(keys, n, dict);
+		this.children = new ArrayList<>();
+		this.children.addAll(children);
 		isInternal = true;
 		isLeaf = false;
-		setNodeNumber();
+		//setNodeNumber();
+	}
+	
+	public BTreeInternalNode(ArrayList<NodeKeyPos> keys, ArrayList<Integer> children, BTreeInternalNode n, boolean copy, String dict) {
+		super(keys, n, true, dict);
+		this.children = new ArrayList<>();
+		this.children.addAll(children);
+		isInternal = true;
+		isLeaf = false;
+		
 	}
 	
 
 	@Override
 	public BTreeNode[] split() {
 		// TODO Auto-generated method stub
-		int mid = keys.size()/2;
-		Long key = keys.get(mid);
-		BTreeInternalNode child1 = new BTreeInternalNode(new ArrayList<Long>(keys.subList(mid+1, keys.size())),new ArrayList<Integer>(children.subList(mid+1, children.size())));
-		child1.flushDataToFile(this.nodeFile);
-		this.keys = new ArrayList<Long>(this.keys.subList(0, mid));
-		this.children = new ArrayList<Integer>(children.subList(0, mid+1));
-		if(this.NodeNumber == 0) {
-			File file = new File(this.nodeFile);
-			setNodeNumber();
-			File other = new File(this.nodeFile);
-			if(!file.renameTo(other)) {
-				System.out.println("can't rename file");
-				System.exit(-1);
-			}
+		int mid = positions.size()/2;
+		byte[] bytes = this.getCorrespondKey(mid);
+		NodeKeyPos key = positions.get(mid);
+		BTreeInternalNode child1 = new BTreeInternalNode(new ArrayList<NodeKeyPos>(positions.subList(mid+1, positions.size())),new ArrayList<Integer>(children.subList(mid+1, children.size())), this,this.dictionary);
+		BTreeInternalNode child2 = new BTreeInternalNode(new ArrayList<NodeKeyPos>(positions.subList(0, mid)),new ArrayList<Integer>(children.subList(0, mid+1)), this, true,this.dictionary);
+		BTreeInternalNode father = new BTreeInternalNode(bytes, key.originFilePos, this.NodeNumber, child1.NodeNumber, this.dictionary);
+		child1.father = this.father;
+		child2.father = this.father;
+		father.rightFatherEntry = this.rightFatherEntry;
+		if (this.rightFatherEntry == -1) {
+			this.rightFatherEntry = 0;
 		}
-		BTreeInternalNode father = new BTreeInternalNode(key, this.NodeNumber, child1.NodeNumber);
+		child2.rightFatherEntry = this.rightFatherEntry;
+		child1.rightFatherEntry = this.rightFatherEntry + 1;
 		
-		return new BTreeNode[] {father, this, child1};
+		
+		return new BTreeNode[] {father, child2, child1};
 	}
 
 	@Override
@@ -64,32 +86,59 @@ public class BTreeInternalNode extends BTreeNode{
 		// TODO Auto-generated method stub
 		BTreeInternalNode pa= (BTreeInternalNode) parent;
 		BTreeInternalNode chi = (BTreeInternalNode) child;
-		if(chi.rightFatherEntry >= pa.keys.size()) {
-			pa.keys.add(chi.keys.get(0));
+		byte[] bytes = chi.getCorrespondKey(0);
+		if(chi.rightFatherEntry >= pa.positions.size()) {
+			pa.positions.add(new NodeKeyPos(curNodeSize, child.positions.get(0).keyLength, child.positions.get(0).originFilePos));
 			pa.children.add(chi.children.get(chi.children.size() - 1));
 		} else {
-			pa.keys.add(chi.rightFatherEntry, chi.keys.get(0));
+			pa.positions.add(chi.rightFatherEntry, new NodeKeyPos(curNodeSize, child.positions.get(0).keyLength, child.positions.get(0).originFilePos));
 			pa.children.add(chi.rightFatherEntry+1, chi.children.get(chi.children.size() - 1));
 		}
+		pa.addKey(bytes);
+		chi.deleteFile();
 	}
 
 	@Override
 	public byte[] toByteArray() {
 		// TODO Auto-generated method stub
-		return null;
+		byte[] res = super.toByteArray();
+		int childrenSize = this.children.size();
+		byte[] bytes;
+		bytes = ByteUtils.intToBytes(childrenSize);
+		for(int j = 0; j < bytes.length; j++) {
+			res[cnt++] = bytes[j];
+		}
+		for(int i = 0; i < childrenSize; i++) {
+			bytes = ByteUtils.intToBytes(this.children.get(i));
+			for(int j = 0; j < bytes.length; j++) {
+				res[cnt++] = bytes[j];
+			}
+		}
+		return res;
 	}
 	
+	
+	@Override
+	public void restoreFromByteArr(byte[] bytes) {
+		super.restoreFromByteArr(bytes);
+		int childSize = ByteUtils.bytesToInt(Arrays.copyOfRange(bytes, cnt, cnt+Integer.BYTES));
+		cnt+= Integer.BYTES;
+		this.children = new ArrayList<>();
+		for(int i = 0; i < childSize ; i++) {
+			this.children.add(ByteUtils.bytesToInt(Arrays.copyOfRange(bytes, cnt, cnt+Integer.BYTES)));
+			cnt+=Integer.BYTES;
+		}
+		setDictionary(this.dictionary);
+	}
+	
+	
 
-	public String toString(String fileName)  {
+	public String toString()  {
 		StringBuilder sb = new StringBuilder();
-		sb.append("Internal Node: " + NodeNumber+"\n");
-		for(Long key: keys) {
-			try {
-				sb.append(BufferedReader.getCorrespondKV(fileName, key) +" ");
-			} catch (IOException e) {
-				// TODO Auto-generated catch block
-				e.printStackTrace();
-			}	
+		sb.append("Internal Node: " + NodeNumber+": " +this.father+"\n");
+		for (int i = 0; i < positions.size(); i++) {
+			sb.append(i + " " + new String(getCorrespondKey(i)));
+			sb.append(" ");
 		}
 		sb.append("\n");
 		for(int i: children) {
@@ -103,55 +152,55 @@ public class BTreeInternalNode extends BTreeNode{
 	@Override
 	public int entryNum() {
 		// TODO Auto-generated method stub
-		return this.keys.size();
+		return this.positions.size();
 	}
-
+	
+	
 	@Override
-	public KVPair search(byte[] key, String fileName) {
+	public long search(byte[] key) {
 		// TODO Auto-generated method stub
-		int i= 0;
-		for(Long k: keys) {
-			try {
-				KVPair kv = BufferedReader.getCorrespondKV(fileName, k);
-				if(Arrays.equals(kv.elem1, key)) {
-					return kv;
-				} else if(KVPair.compare(key, kv.elem1) < 0) {
-					return BufferedReader.loadBTreeNode(children.get(i)).search(key, fileName);
-				}
-			} catch (IOException e) {
-				// TODO Auto-generated catch block
-				e.printStackTrace();
+		for (int i = 0; i< positions.size(); i++) {
+			byte[] keyInNode = getCorrespondKey(i);
+			if (Arrays.equals(keyInNode, key)) {
+				return positions.get(i).originFilePos;
+			}else if(KVPair.compare(key, keyInNode) < 0) {
+				return BufferedReader.loadBTreeNode(children.get(i), this.dictionary).search(key);
 			}
-			i++;
 		}
-		
-		return BufferedReader.loadBTreeNode(children.get(children.size()-1)).search(key, fileName);
+		return BufferedReader.loadBTreeNode(children.get(children.size()-1), this.dictionary).search(key);
 	}
 
+
+	
+
+	
 	@Override
-	public void flushDataToFile(String srcFile) {
+	public byte[] getCorrespondKey(int i) {
 		// TODO Auto-generated method stub
-		String fileName = ""+ this.NodeNumber + BTreeNode.nodeSuffix;
-		File file = new File(fileName);
+		NodeKeyPos nodePos = positions.get(i);
+		long pos = nodePos.inNodePos;
+		int keySize = nodePos.keyLength;
+		//System.out.println("node number:" + this.NodeNumber);
 		try {
-			if(!file.exists()) {
-				file.createNewFile();
+			if (pos + keySize <= BTreeLeafNode.DEFAULT_DATA_SIZE&& data != null && pos+keySize <= data.size()) {
+				List<Byte> lst  = data.subList((int)pos, (int)pos+keySize);
+				byte[] keyBytes = new byte[keySize];
+				for(int j = 0; j < keySize; j++) {
+					keyBytes[j] = lst.get(j);
+				}
+				return keyBytes;
+
+			} else {
+				//System.out.println(data.size());
+				return BufferedReader.getCorrespondFileByteArr(this.nodeFile, pos, keySize);
 			}
-			long curPos = 0;
-			RandomAccessFile raf = new RandomAccessFile(file, "rwd");
-			for(int i = 0; i < keys.size(); i++) {
-				Long pos = keys.get(i);
-				KVPair kv;
-				kv = BufferedReader.getCorrespondKV(srcFile, pos);
-				raf.write(kv.tobyteArray());
-				keys.set(i,  curPos);
-				curPos += kv.size;
-			}
-			raf.close();
-		} catch (IOException e1) {
+		} catch (IOException e) {
 			// TODO Auto-generated catch block
-			e1.printStackTrace();
+			e.printStackTrace();
 		}
+		return null;
 	}
+
+	
 	
 }

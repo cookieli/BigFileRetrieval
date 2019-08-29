@@ -12,6 +12,7 @@ import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -26,12 +27,13 @@ import lzx.retrieval.storage.BTreeNode;
 public class BufferedReader {
 
 	public static final int DEFAULT_Node_SIZE = 10;
-	public static final int DEFAULT_Node_NUM = 1024;
-	
+	public static final int DEFAULT_Node_NUM = 5;
+
 	public boolean hasReadAllFile;
 	public boolean bufferIsEmpty;
 	public String fileName;
-	public String BTreeFileName;
+	public String TreeDictionary;
+	public String posFile;
 	public RandomAccessFile raf;
 	public FileChannel channel;
 	public ByteBuffer buff;
@@ -39,7 +41,7 @@ public class BufferedReader {
 	public long position = 0;
 	public byte[] data;
 
-	public static Map<Integer, BTreeNode> Nodes;
+	public static LRUcache Nodes;
 
 	public int BufferoffSet = 0;
 	public int bufferBound = 0;
@@ -49,29 +51,48 @@ public class BufferedReader {
 		String name = fileName.substring(0, index);
 		return name + suffix;
 	}
-	
-	
 
-	public BufferedReader(String name) throws IOException {
+	public BufferedReader(String name, long pos) throws IOException {
 		fileName = name;
+		this.position = pos;
 		raf = new RandomAccessFile(fileName, "r");
+		raf.seek(pos);
 		channel = raf.getChannel();
 		buff = ByteBuffer.allocate(DEFAULT_Node_SIZE);
-		BTreeFileName = getCorrespondTreeFileName(fileName, ".tree");
-		File f = new File(BTreeFileName);
-		Nodes = new HashMap<>();
-		if (!f.exists()) {
-			f.createNewFile();
-			getNxtNode();
-		} else if(f.length() == 0){
-			getNxtNode();
-		} else {
-			
-		}
+		TreeDictionary = fileName.substring(0, fileName.lastIndexOf(".")) + "Tree";// getCorrespondTreeFileName(fileName,
+																					// ".tree");
+		posFile = TreeDictionary + "/" + "pos.data";
+		// File f = new File(BTreeFileName);
+		Nodes = new LRUcache(DEFAULT_Node_NUM);
 		hasReadAllFile = false;
-		bufferIsEmpty =false;
+		bufferIsEmpty = false;
+		getNxtNode();
+		
 	}
-	
+
+	public void close() {
+		Nodes.clear();
+		File file = new File(this.posFile);
+		try {
+			if (!file.exists()) {
+				file.getParentFile().mkdir();
+
+				if (!file.createNewFile()) {
+					System.out.println("can't create");
+					System.exit(-1);
+				}
+
+			}
+			RandomAccessFile raf = new RandomAccessFile(this.posFile, "rw");
+			raf.writeLong(position);
+			raf.close();
+		} catch (IOException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+		}
+
+	}
+
 	public static KVPair getCorrespondKV(String file, long pos) throws IOException {
 		RandomAccessFile raf = new RandomAccessFile(file, "r");
 		raf.seek(pos);
@@ -86,40 +107,64 @@ public class BufferedReader {
 		raf.read(valueBytes);
 		raf.close();
 		return new KVPair(keyBytes, valueBytes);
-		
+
 	}
-	
+
+	public static byte[] getOriginFileByteArr(String file, long pos) throws IOException {
+		RandomAccessFile raf = new RandomAccessFile(file, "r");
+		raf.seek(pos);
+		byte[] intBytes = new byte[4];
+		raf.read(intBytes);
+		int keySize = ByteBuffer.wrap(intBytes).getInt();
+		byte[] keyBytes = new byte[keySize];
+		raf.read(keyBytes);
+		raf.close();
+		return keyBytes;
+	}
+
+	public static byte[] getCorrespondFileByteArr(String file, long pos, int keySize) throws IOException {
+		RandomAccessFile raf = new RandomAccessFile(file, "r");
+		raf.seek(pos);
+		byte[] keyBytes = new byte[keySize];
+		raf.read(keyBytes);
+		raf.close();
+		return keyBytes;
+	}
+
 	public void flowDataUp(BTreeNode node) {
-		while(node.entryNum() > BTreeNode.DEFAULT_Node_SIZE) {
+		while (node.entryNum() > BTreeNode.DEFAULT_B_ORDER) {
 			BTreeNode[] splitNodes = node.split();
-			if(node.father != -1) {
-				BTreeInternalNode fatherNode = (BTreeInternalNode) loadBTreeNode(node.father);
+			if (node.father != -1) {
+				BTreeInternalNode fatherNode = (BTreeInternalNode) loadBTreeNode(node.father, this.TreeDictionary);
 				fatherNode.merge(fatherNode, splitNodes[0]);
 				node = fatherNode;
 				storeBTreeNode(splitNodes[2]);
+				storeBTreeNode(splitNodes[1]);
 			} else {
 				splitNodes[0].setHeader(true);
-				//splitNodes[0].setNodeNumber(0);
+				// splitNodes[0].setNodeNumber(0);
 				splitNodes[1].setFather(0);
 				splitNodes[2].setFather(0);
-				//System.out.println(splitNodes[0]);
-				for(BTreeNode p: splitNodes) {
+				// System.out.println(splitNodes[0]);
+				for (BTreeNode p : splitNodes) {
 					storeBTreeNode(p);
 				}
 				return;
 			}
 		}
 	}
-	public void storeKVIntoLeaf(KVPair kv, BTreeLeafNode leaf) throws IOException {
-		leaf.addKey(lastPosition, fileName);
+
+	public void storeKVIntoLeaf(byte[] bytes, BTreeLeafNode leaf) throws IOException {
+		leaf.addKey(lastPosition, bytes, true);
 		flowDataUp(leaf);
 	}
-	public void flowKVIntoInternal(KVPair kv, BTreeInternalNode Node) throws IOException {
+
+	public void flowKVIntoInternal(byte[] bytes, BTreeInternalNode Node) throws IOException {
 		int i;
-		for(i = 0; i < Node.keys.size(); i++) {
+		for (i = 0; i < Node.positions.size(); i++) {
 			try {
-				if(KVPair.compare(kv.elem1, BufferedReader.getCorrespondKV(fileName,Node.keys.get(i)).elem1) < 0) {
-					storeKVIntoNode(kv, Node.children.get(i));
+				if (KVPair.compare(bytes, Node.getCorrespondKey(i)) < 0) {
+					storeKVIntoNode(bytes, Node.children.get(i));
 					return;
 				}
 			} catch (IOException e) {
@@ -127,56 +172,76 @@ public class BufferedReader {
 				e.printStackTrace();
 			}
 		}
-		storeKVIntoNode(kv, Node.children.get(Node.keys.size()));
+		storeKVIntoNode(bytes, Node.children.get(Node.positions.size()));
 	}
-	public void storeKVIntoNode(KVPair kv, int NodeId) throws IOException {
+
+	public void storeKVIntoNode(byte[] bytes, int NodeId) throws IOException {
 		if (NodeId == -1) {
-			BTreeLeafNode leaf = new BTreeLeafNode();
+			BTreeLeafNode leaf = new BTreeLeafNode(this.TreeDictionary);
 			leaf.setHeader(true);
-			leaf.addKey(lastPosition, fileName);
+			leaf.addKey(lastPosition, bytes, true);
 			storeBTreeNode(leaf);
 		} else {
-			BTreeNode Node = loadBTreeNode(NodeId);
+			BTreeNode Node = loadBTreeNode(NodeId, this.TreeDictionary);
 			if (Node.isLeaf) {
-				storeKVIntoLeaf( kv, (BTreeLeafNode) Node);
+				storeKVIntoLeaf(bytes, (BTreeLeafNode) Node);
 			} else {
-				flowKVIntoInternal(kv, (BTreeInternalNode)Node);
+				flowKVIntoInternal(bytes, (BTreeInternalNode) Node);
 			}
 		}
 	}
 
-	public static BTreeNode loadBTreeNode(int NodeId) {
+	public static BTreeNode loadBTreeNode(int NodeId, String dict) {
 		if (Nodes.containsKey(NodeId)) {
 			return Nodes.get(NodeId);
+		} else {
+			// System.out.println("in this");
+			File treeFile = new File(dict + "/" + NodeId + ".tree");
+			if (treeFile.exists()) {
+				try {
+					byte[] content = Files.readAllBytes(treeFile.toPath());
+					return BTreeNode.generateBTreeNodes(content, dict);
+				} catch (IOException e) {
+					// TODO Auto-generated catch block
+					e.printStackTrace();
+				}
+			}
+			System.out.println("happens in loadBTreeNode");
+			return null;
 		}
-		return null;
+		// return null;
 	}
 
 	public void storeBTreeNode(BTreeNode Node) {
+		// Node.setDictionary(this.TreeDictionary);
 		Nodes.put(Node.NodeNumber, Node);
-		
+
 	}
-	
-	public KVPair get(byte[] key) throws IOException {
-		if(!Nodes.isEmpty()) {
-			KVPair res = loadBTreeNode(0).search(key, fileName);
-			if(res!= null)
+
+	public long get(byte[] key) throws IOException {
+		if (!Nodes.isEmpty() || position>0) {
+			long res = loadBTreeNode(0, this.TreeDictionary).search(key);
+			if (res != -1)
 				return res;
-			
+
 		}
-		if(bufferIsEmpty) {
-			return null;
+		if (bufferIsEmpty) {
+			//System.out.println("in get false");
+			return -1;
 		}
-		KVPair kv = getNextKV();
+		byte[] bytes = getNextKey();
 		if (Nodes.isEmpty()) {
-			storeKVIntoNode(kv, -1);
+			storeKVIntoNode(bytes, -1);
+		} else {
+			storeKVIntoNode(bytes, 0);
 		}
-		while (!Arrays.equals(key, kv.elem1)) {
-			kv = getNextKV();
-			if(kv == null) break;
-			storeKVIntoNode(kv, 0);
+		while (!Arrays.equals(key, bytes)) {
+			bytes = getNextKey();
+			if (bytes == null)
+				break;
+			storeKVIntoNode(bytes, 0);
 		}
-		return kv;
+		return lastPosition;
 	}
 
 	public void getNxtNode() {
@@ -192,8 +257,8 @@ public class BufferedReader {
 		buff.clear();
 		data = out.toByteArray();
 		bufferBound = data.length;
-		if(hasReadAllFile) {
-			if(bufferBound == 0)
+		if (hasReadAllFile) {
+			if (bufferBound == 0)
 				bufferIsEmpty = true;
 		}
 		BufferoffSet = 0;
@@ -226,41 +291,42 @@ public class BufferedReader {
 		return Arrays.copyOfRange(data, prev, BufferoffSet);
 	}
 
-	public KVPair getNextKV() {
-		if(bufferIsEmpty)
+	public byte[] getNextKey() {
+		if (bufferIsEmpty)
 			return null;
 		int key_Size = getSize();
 		// System.out.println(key_Size);
 		byte[] key = getValue(key_Size);
 		int valueSize = getSize();
-		byte[] value = getValue(valueSize);
+		getValue(valueSize);
 		lastPosition = position;
-		position += 8+ key.length + value.length;
-		if(hasReadAllFile && BufferoffSet == bufferBound) {
+		position += 8 + key.length + valueSize;
+		if (hasReadAllFile && BufferoffSet == bufferBound) {
 			bufferIsEmpty = true;
 		}
-		return new KVPair(key, value);
+		return key;
 	}
-	
+
 	public String toString() {
 		StringBuilder sb = new StringBuilder();
 		Queue<BTreeNode> queue = new LinkedList<>();
-		BTreeNode Node = loadBTreeNode(0);
-		//System.out.println("header"+ Node.toString());
+		BTreeNode Node = loadBTreeNode(0, this.TreeDictionary);
+		// System.out.println("header"+ Node.toString());
 		queue.add(Node);
-		while(!queue.isEmpty()) {
+		while (!queue.isEmpty()) {
 			BTreeNode p = queue.remove();
-			if(p == null) return sb.toString();
-			if(p.isInternal) {
-				
+			if (p == null)
+				return sb.toString();
+			if (p.isInternal) {
+
 				BTreeInternalNode pI = (BTreeInternalNode) p;
-				//System.out.println(pI.toString());
-				for(int i: pI.children) {
-					//System.out.println(pI.children.get(i));
-					queue.add(loadBTreeNode(i));
+				// System.out.println(pI.toString());
+				for (int i : pI.children) {
+					// System.out.println(pI.children.get(i));
+					queue.add(loadBTreeNode(i, this.TreeDictionary));
 				}
 			}
-			sb.append(p.toString(this.fileName));
+			sb.append(p.toString());
 		}
 		return sb.toString();
 	}
@@ -284,7 +350,7 @@ public class BufferedReader {
 			byte[] valueBytes = str[3].trim().getBytes(StandardCharsets.UTF_8);
 //		File f = new File(outFile);
 //		f.createNewFile();
-			
+
 //		for(int i = 0; i < keyByte.length; i++) {
 //			System.out.print(keyByte[i] + " ");
 //		}
@@ -303,8 +369,8 @@ public class BufferedReader {
 //		for(int i = 0; i < b.length; i++) {
 //			System.out.println(b[i]);
 //		}
-		BufferedReader r = new BufferedReader(outFile);
-		System.out.println(r.getNextKV());
+		BufferedReader r = new BufferedReader(outFile, 0);
+		System.out.println(new String(r.getNextKey()));
 
 	}
 
